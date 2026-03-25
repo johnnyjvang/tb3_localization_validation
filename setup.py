@@ -24,6 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'initial_pose_response = tb3_localization_validation.initial_pose_response:main',
+            'amcl_pose_stability = tb3_localization_validation.amcl_pose_stability:main',
+            'global_local_consistency = tb3_localization_validation.global_local_consistency:main',
             # Added to print and reset json output
             'reset_results = tb3_tf_validation.reset_results:main',
             'summary_report = tb3_tf_validation.summary_report:main',
