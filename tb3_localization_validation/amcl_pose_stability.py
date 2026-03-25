@@ -3,116 +3,269 @@
 """
 amcl_pose_stability.py
 
-Measure AMCL pose stability while the robot remains stationary.
+Checks whether AMCL pose remains stable while the robot is stationary.
 
-Checks:
-- /amcl_pose is being published
-- pose jitter in x/y/yaw over a fixed sample window
+Usage:
+  ros2 run tb3_localization_validation amcl_pose_stability --ros-args -p use_sim_time:=true
 """
 
 import math
+import statistics
 import time
-from typing import List, Tuple
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseWithCovarianceStamped
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
 
-class AMCLPoseStability(Node):
-    def __init__(self) -> None:
+def quaternion_to_yaw(x, y, z, w):
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def wrap_angle(angle):
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+class AmclPoseStability(Node):
+    def __init__(self):
         super().__init__('amcl_pose_stability')
 
-        self.amcl_sub = self.create_subscription(
-            PoseWithCovarianceStamped,
-            '/amcl_pose',
-            self.amcl_callback,
-            10
+        self.declare_parameter('test_duration_sec', 15.0)
+        self.declare_parameter('warmup_sec', 3.0)
+        self.declare_parameter('wait_for_topic_sec', 15.0)
+
+        self.test_duration = float(self.get_parameter('test_duration_sec').value)
+        self.warmup_sec = float(self.get_parameter('warmup_sec').value)
+        self.wait_for_topic_sec = float(self.get_parameter('wait_for_topic_sec').value)
+
+        self.latest_msg = None
+        self.received_count = 0
+
+        amcl_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
 
-        self.samples: List[Tuple[float, float, float]] = []
-        self.start_time = time.time()
-        self.last_progress_second = -1
+        self.subscription = self.create_subscription(
+            PoseWithCovarianceStamped,
+            '/amcl_pose',
+            self.pose_callback,
+            amcl_qos
+        )
 
-        self.sample_duration = 10.0
-        self.timeout_sec = 20.0
+        use_sim_time = False
+        if self.has_parameter('use_sim_time'):
+            use_sim_time = bool(self.get_parameter('use_sim_time').value)
 
-        self.timer = self.create_timer(0.2, self.run)
+        self.get_logger().info('Subscribed to /amcl_pose')
+        self.get_logger().info(
+            f'Parameters: use_sim_time={use_sim_time}, '
+            f'test_duration_sec={self.test_duration}, '
+            f'warmup_sec={self.warmup_sec}, '
+            f'wait_for_topic_sec={self.wait_for_topic_sec}'
+        )
 
-        self.get_logger().info('========== AMCL POSE STABILITY ==========')
+    def pose_callback(self, msg):
+        self.latest_msg = msg
+        self.received_count += 1
 
-    def quaternion_to_yaw(self, z: float, w: float) -> float:
-        return math.atan2(2.0 * w * z, 1.0 - 2.0 * z * z)
+        if self.received_count == 1:
+            self.get_logger().info('Received first /amcl_pose message.')
 
-    def amcl_callback(self, msg: PoseWithCovarianceStamped) -> None:
-        x = msg.pose.pose.position.x
-        y = msg.pose.pose.position.y
-        z = msg.pose.pose.orientation.z
-        w = msg.pose.pose.orientation.w
-        yaw = self.quaternion_to_yaw(z, w)
+    def wait_for_first_message(self):
+        self.get_logger().info('Waiting for /amcl_pose messages...')
+        start = time.time()
 
-        self.samples.append((x, y, yaw))
+        while rclpy.ok() and self.latest_msg is None:
+            rclpy.spin_once(self, timeout_sec=0.2)
 
-    def run(self) -> None:
-        elapsed = time.time() - self.start_time
-        current_second = int(elapsed)
+            if time.time() - start > self.wait_for_topic_sec:
+                self.get_logger().error(
+                    f'No /amcl_pose messages received within {self.wait_for_topic_sec:.1f} seconds.'
+                )
+                return False
 
-        if current_second != self.last_progress_second:
-            self.last_progress_second = current_second
-            self.get_logger().info(
-                f'[INFO] Recording stationary AMCL pose... {elapsed:.1f}/{self.sample_duration:.1f} sec '
-                f'| samples: {len(self.samples)}'
+        return True
+
+    def collect_samples(self, duration_sec, label='collection'):
+        samples_x = []
+        samples_y = []
+        samples_yaw = []
+        cov_xx = []
+        cov_yy = []
+        cov_yawyaw = []
+
+        start = time.time()
+        last_print = start
+
+        while rclpy.ok() and (time.time() - start) < duration_sec:
+            rclpy.spin_once(self, timeout_sec=0.2)
+
+            if self.latest_msg is None:
+                continue
+
+            pose = self.latest_msg.pose.pose
+            cov = self.latest_msg.pose.covariance
+
+            x = pose.position.x
+            y = pose.position.y
+            yaw = quaternion_to_yaw(
+                pose.orientation.x,
+                pose.orientation.y,
+                pose.orientation.z,
+                pose.orientation.w
             )
 
-        if elapsed >= self.timeout_sec and len(self.samples) < 2:
-            self.get_logger().error('[FAIL] Timed out waiting for enough /amcl_pose samples')
-            self.shutdown()
-            return
+            samples_x.append(x)
+            samples_y.append(y)
+            samples_yaw.append(yaw)
 
-        if elapsed >= self.sample_duration and len(self.samples) >= 2:
-            self.analyze()
+            cov_xx.append(cov[0])
+            cov_yy.append(cov[7])
+            cov_yawyaw.append(cov[35])
 
-    def analyze(self) -> None:
-        xs = [s[0] for s in self.samples]
-        ys = [s[1] for s in self.samples]
-        yaws = [math.degrees(s[2]) for s in self.samples]
+            now = time.time()
+            if now - last_print >= 1.0:
+                elapsed = now - start
+                self.get_logger().info(
+                    f'{label}: {elapsed:.1f}/{duration_sec:.1f} sec, '
+                    f'samples={len(samples_x)}, '
+                    f'x={x:.4f}, y={y:.4f}, yaw_deg={math.degrees(yaw):.2f}'
+                )
+                last_print = now
+
+        return samples_x, samples_y, samples_yaw, cov_xx, cov_yy, cov_yawyaw
+
+    def compute_stats(self, xs, ys, yaws, cov_xx, cov_yy, cov_yawyaw):
+        if len(xs) < 2:
+            return None
+
+        x_mean = statistics.mean(xs)
+        y_mean = statistics.mean(ys)
+
+        yaw0 = yaws[0]
+        yaw_rel = [wrap_angle(y - yaw0) for y in yaws]
+        yaw_mean_rel = statistics.mean(yaw_rel)
+
+        x_std = statistics.stdev(xs)
+        y_std = statistics.stdev(ys)
+        yaw_std_rad = statistics.stdev(yaw_rel)
 
         x_span = max(xs) - min(xs)
         y_span = max(ys) - min(ys)
-        yaw_span = max(yaws) - min(yaws)
+        yaw_span_rad = max(yaw_rel) - min(yaw_rel)
 
-        self.get_logger().info('')
-        self.get_logger().info('========== ANALYSIS ==========')
-        self.get_logger().info(f'[INFO] Samples collected: {len(self.samples)}')
-        self.get_logger().info(f'[INFO] X span: {x_span:.4f} m')
-        self.get_logger().info(f'[INFO] Y span: {y_span:.4f} m')
-        self.get_logger().info(f'[INFO] Yaw span: {yaw_span:.4f} deg')
+        avg_cov_xx = statistics.mean(cov_xx)
+        avg_cov_yy = statistics.mean(cov_yy)
+        avg_cov_yawyaw = statistics.mean(cov_yawyaw)
 
-        if x_span <= 0.05 and y_span <= 0.05 and yaw_span <= 5.0:
-            self.get_logger().info('[PASS] AMCL pose appears stable while stationary')
+        return {
+            'samples': len(xs),
+            'x_mean': x_mean,
+            'y_mean': y_mean,
+            'yaw_mean_rel_rad': yaw_mean_rel,
+            'x_std': x_std,
+            'y_std': y_std,
+            'yaw_std_rad': yaw_std_rad,
+            'x_span': x_span,
+            'y_span': y_span,
+            'yaw_span_rad': yaw_span_rad,
+            'avg_cov_xx': avg_cov_xx,
+            'avg_cov_yy': avg_cov_yy,
+            'avg_cov_yawyaw': avg_cov_yawyaw,
+        }
+
+    def grade_result(self, stats):
+        x_std = stats['x_std']
+        y_std = stats['y_std']
+        yaw_std_deg = math.degrees(stats['yaw_std_rad'])
+        x_span = stats['x_span']
+        y_span = stats['y_span']
+        yaw_span_deg = math.degrees(stats['yaw_span_rad'])
+
+        if (
+            x_std <= 0.01 and
+            y_std <= 0.01 and
+            yaw_std_deg <= 1.5 and
+            x_span <= 0.03 and
+            y_span <= 0.03 and
+            yaw_span_deg <= 4.0
+        ):
+            return 'PASS'
+        elif (
+            x_std <= 0.03 and
+            y_std <= 0.03 and
+            yaw_std_deg <= 4.0 and
+            x_span <= 0.08 and
+            y_span <= 0.08 and
+            yaw_span_deg <= 10.0
+        ):
+            return 'WARN'
         else:
-            self.get_logger().warn('[WARN] AMCL pose jitter is larger than expected')
+            return 'FAIL'
 
-        self.shutdown()
+    def run_test(self):
+        if not self.wait_for_first_message():
+            return 1
 
-    def shutdown(self) -> None:
-        self.get_logger().info('AMCL pose stability check complete. Shutting down.')
-        self.destroy_node()
-        rclpy.shutdown()
+        self.get_logger().info(
+            f'Warmup for {self.warmup_sec:.1f} seconds to let AMCL settle...'
+        )
+        self.collect_samples(self.warmup_sec, label='warmup')
+
+        self.get_logger().info(
+            f'Starting AMCL stationary stability measurement for {self.test_duration:.1f} seconds...'
+        )
+        xs, ys, yaws, cov_xx, cov_yy, cov_yawyaw = self.collect_samples(
+            self.test_duration,
+            label='measuring'
+        )
+
+        stats = self.compute_stats(xs, ys, yaws, cov_xx, cov_yy, cov_yawyaw)
+        if stats is None:
+            self.get_logger().error('Not enough /amcl_pose samples collected.')
+            return 1
+
+        result = self.grade_result(stats)
+
+        self.get_logger().info('----------------------------------------')
+        self.get_logger().info('AMCL Pose Stability Results')
+        self.get_logger().info('----------------------------------------')
+        self.get_logger().info(f'Result      : {result}')
+        self.get_logger().info(f'Samples     : {stats["samples"]}')
+        self.get_logger().info(f'X std dev   : {stats["x_std"]:.4f} m')
+        self.get_logger().info(f'Y std dev   : {stats["y_std"]:.4f} m')
+        self.get_logger().info(f'Yaw std dev : {math.degrees(stats["yaw_std_rad"]):.2f} deg')
+        self.get_logger().info(f'X span      : {stats["x_span"]:.4f} m')
+        self.get_logger().info(f'Y span      : {stats["y_span"]:.4f} m')
+        self.get_logger().info(f'Yaw span    : {math.degrees(stats["yaw_span_rad"]):.2f} deg')
+        self.get_logger().info(f'Avg cov x   : {stats["avg_cov_xx"]:.6f}')
+        self.get_logger().info(f'Avg cov y   : {stats["avg_cov_yy"]:.6f}')
+        self.get_logger().info(f'Avg cov yaw : {stats["avg_cov_yawyaw"]:.6f}')
+        self.get_logger().info('----------------------------------------')
+
+        return 0
 
 
-def main(args=None) -> None:
+def main(args=None):
     rclpy.init(args=args)
-    node = AMCLPoseStability()
+    node = AmclPoseStability()
 
     try:
-        rclpy.spin(node)
+        exit_code = node.run_test()
     except KeyboardInterrupt:
-        pass
+        node.get_logger().info('Interrupted by user.')
+        exit_code = 0
     finally:
-        if rclpy.ok():
-            node.destroy_node()
-            rclpy.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+    raise SystemExit(exit_code)
 
 
 if __name__ == '__main__':
