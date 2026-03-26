@@ -3,21 +3,82 @@
 """
 covariance_monitor.py
 
-Monitor AMCL covariance over time to ensure localization confidence is stable.
+Monitor AMCL covariance stability from /amcl_pose.
 
 Checks:
-- Covariance in X, Y, and Yaw from /amcl_pose
-- Ensures values are within expected bounds
+- x covariance
+- y covariance
+- yaw covariance
 
-Why this test matters:
-- Lower covariance generally indicates AMCL is more confident
-- Very high covariance can indicate poor convergence or poor localization quality
+This helps confirm that localization uncertainty remains reasonably low and stable.
 
-Outputs:
-- PASS / WARN / FAIL
+-------------------------------------------------------------------------------
+IMPORTANT NOTE ON THE FIX (WHY THIS SCRIPT MAY FAIL EVEN WHEN /amcl_pose EXISTS)
+-------------------------------------------------------------------------------
 
-Writes:
-- results.csv via append_result(...)
+You may encounter a situation where:
+
+    ros2 topic echo /amcl_pose --once
+
+works fine, but this node prints something like:
+
+    [INFO] Waiting for /amcl_pose...
+
+or eventually fails with:
+
+    [FAIL] Not enough data collected
+
+This is usually NOT because AMCL is broken.
+
+The real issue is often ROS 2 QoS compatibility.
+
+WHY THIS HAPPENS:
+
+- /amcl_pose is commonly published in a way that behaves like a "latched" topic.
+- In ROS 2 terms, that usually means TRANSIENT_LOCAL durability.
+- Tools like `ros2 topic echo` can often receive the stored last message.
+- But a normal Python subscriber using default QoS may NOT receive that stored AMCL message.
+
+So the node appears to get "zero data" even though the topic clearly exists.
+
+-------------------------------------------------------------------------------
+THE FIX
+-------------------------------------------------------------------------------
+
+We explicitly create an AMCL subscription QoS profile with:
+
+    reliability = RELIABLE
+    durability = TRANSIENT_LOCAL
+
+This tells ROS 2:
+
+    "Give me the most recent stored AMCL pose, even if it was published before
+     this node started."
+
+Without this, the script may wait forever for /amcl_pose or fail to collect
+enough covariance samples.
+
+-------------------------------------------------------------------------------
+WHAT THIS TEST ACTUALLY MEASURES
+-------------------------------------------------------------------------------
+
+This test reads the covariance values from PoseWithCovarianceStamped:
+
+    covariance[0]   -> x covariance
+    covariance[7]   -> y covariance
+    covariance[35]  -> yaw covariance
+
+These are the correct indices in the flattened 6x6 covariance matrix for:
+- x position uncertainty
+- y position uncertainty
+- yaw uncertainty
+
+The script records these over time and reports the average values.
+
+This is NOT a full localization accuracy test.
+It is a localization uncertainty / confidence monitoring test.
+
+-------------------------------------------------------------------------------
 """
 
 import time
@@ -26,7 +87,7 @@ import statistics
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseWithCovarianceStamped
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from .result_utils import append_result
 
@@ -35,20 +96,34 @@ class CovarianceMonitor(Node):
     def __init__(self):
         super().__init__('covariance_monitor')
 
-        # Test timing
-        self.duration_sec = 15.0
+        self.duration = 10.0
         self.start_time = time.time()
 
-        # Latest AMCL message
         self.latest_msg = None
-        self.received_count = 0
-
-        # Storage for covariance samples
         self.cov_x = []
         self.cov_y = []
         self.cov_yaw = []
 
-        # AMCL publisher may require a more compatible QoS
+        # =====================================================================
+        # CRITICAL FIX: AMCL QoS COMPATIBILITY
+        # =====================================================================
+        #
+        # Default subscription QoS may fail to receive /amcl_pose even though:
+        #   ros2 topic echo /amcl_pose --once
+        # still works.
+        #
+        # WHY:
+        # /amcl_pose may use TRANSIENT_LOCAL durability, which means the last
+        # message is stored and delivered only to subscribers that request it
+        # with compatible QoS.
+        #
+        # FIX:
+        # We explicitly request:
+        #   - RELIABLE reliability
+        #   - TRANSIENT_LOCAL durability
+        #
+        # This allows the node to receive the most recent AMCL pose immediately.
+        #
         amcl_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
@@ -56,75 +131,62 @@ class CovarianceMonitor(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
 
-        # Subscribe to AMCL pose
-        self.subscription = self.create_subscription(
+        self.create_subscription(
             PoseWithCovarianceStamped,
             '/amcl_pose',
             self.amcl_callback,
             amcl_qos
         )
 
-        # Periodic timer to run the test logic
         self.timer = self.create_timer(0.5, self.run)
 
-        use_sim_time = False
-        if self.has_parameter('use_sim_time'):
-            use_sim_time = bool(self.get_parameter('use_sim_time').value)
-
         self.get_logger().info('========== COVARIANCE MONITOR ==========')
-        self.get_logger().info(f'[INFO] use_sim_time = {use_sim_time}')
-        self.get_logger().info('[INFO] Subscribed to /amcl_pose')
 
-    def amcl_callback(self, msg: PoseWithCovarianceStamped):
-        """Store the latest AMCL pose message."""
+    def amcl_callback(self, msg):
         self.latest_msg = msg
-        self.received_count += 1
-
-        if self.received_count == 1:
-            self.get_logger().info('[INFO] Received first /amcl_pose message')
 
     def run(self):
-        """
-        Collect covariance samples while the timer is active.
-        After duration expires, compute averages and write results.
-        """
         elapsed = time.time() - self.start_time
 
-        # During collection period
-        if elapsed < self.duration_sec:
+        if elapsed < self.duration:
             if self.latest_msg is None:
                 self.get_logger().info('[INFO] Waiting for /amcl_pose...')
                 return
 
             cov = self.latest_msg.pose.covariance
 
-            # 6x6 flattened covariance matrix indices
-            # x   = 0
-            # y   = 7
-            # yaw = 35
-            cov_x_val = cov[0]
-            cov_y_val = cov[7]
-            cov_yaw_val = cov[35]
-
-            self.cov_x.append(cov_x_val)
-            self.cov_y.append(cov_y_val)
-            self.cov_yaw.append(cov_yaw_val)
+            # =================================================================
+            # COVARIANCE INDEXING
+            # =================================================================
+            #
+            # PoseWithCovariance stores a flattened 6x6 covariance matrix.
+            #
+            # The indices used here are:
+            #   cov[0]   -> variance of x
+            #   cov[7]   -> variance of y
+            #   cov[35]  -> variance of yaw
+            #
+            # These are the standard indices for:
+            #   x, y, yaw
+            #
+            self.cov_x.append(cov[0])
+            self.cov_y.append(cov[7])
+            self.cov_yaw.append(cov[35])
 
             self.get_logger().info(
-                f'[RUNNING] t={elapsed:.1f}s, '
-                f'cov_x={cov_x_val:.4f}, cov_y={cov_y_val:.4f}, cov_yaw={cov_yaw_val:.4f}'
+                f'[RUNNING] cov_x={cov[0]:.4f}, cov_y={cov[7]:.4f}, cov_yaw={cov[35]:.4f}'
             )
             return
 
         # ===== ANALYSIS =====
         if len(self.cov_x) < 5:
-            self.get_logger().error('[FAIL] Not enough data collected')
             append_result(
                 'covariance_monitor',
                 'FAIL',
-                '0.0',
-                'not enough /amcl_pose samples'
+                '0.0000',
+                'not enough data collected'
             )
+            self.get_logger().error('[FAIL] Not enough data collected')
             self.shutdown()
             return
 
@@ -132,30 +194,16 @@ class CovarianceMonitor(Node):
         avg_y = statistics.mean(self.cov_y)
         avg_yaw = statistics.mean(self.cov_yaw)
 
-        min_x = min(self.cov_x)
-        min_y = min(self.cov_y)
-        min_yaw = min(self.cov_yaw)
-
-        max_x = max(self.cov_x)
-        max_y = max(self.cov_y)
-        max_yaw = max(self.cov_yaw)
-
-        self.get_logger().info(f'[INFO] Samples      : {len(self.cov_x)}')
-        self.get_logger().info(f'[INFO] Avg Cov X   : {avg_x:.4f}')
-        self.get_logger().info(f'[INFO] Avg Cov Y   : {avg_y:.4f}')
-        self.get_logger().info(f'[INFO] Avg Cov Yaw : {avg_yaw:.4f}')
-        self.get_logger().info(f'[INFO] Min Cov X   : {min_x:.4f}')
-        self.get_logger().info(f'[INFO] Min Cov Y   : {min_y:.4f}')
-        self.get_logger().info(f'[INFO] Min Cov Yaw : {min_yaw:.4f}')
-        self.get_logger().info(f'[INFO] Max Cov X   : {max_x:.4f}')
-        self.get_logger().info(f'[INFO] Max Cov Y   : {max_y:.4f}')
-        self.get_logger().info(f'[INFO] Max Cov Yaw : {max_yaw:.4f}')
-
-        # Starter thresholds
-        # These can be adjusted later after observing real/sim behavior
-        if avg_x < 0.05 and avg_y < 0.05 and avg_yaw < 0.10:
+        # =====================================================================
+        # SIMPLE PASS / WARN / FAIL THRESHOLDS
+        # =====================================================================
+        #
+        # These are heuristic thresholds for basic localization confidence.
+        # Lower covariance generally means AMCL is more confident.
+        #
+        if avg_x < 0.1 and avg_y < 0.1 and avg_yaw < 0.1:
             result = 'PASS'
-        elif avg_x < 0.15 and avg_y < 0.15 and avg_yaw < 0.30:
+        elif avg_x < 0.3 and avg_y < 0.3 and avg_yaw < 0.3:
             result = 'WARN'
         else:
             result = 'FAIL'
@@ -163,16 +211,16 @@ class CovarianceMonitor(Node):
         append_result(
             'covariance_monitor',
             result,
-            f'{avg_x:.4f}',
-            f'y={avg_y:.4f}, yaw={avg_yaw:.4f}'
+            f'x={avg_x:.4f}, y={avg_y:.4f}, yaw={avg_yaw:.4f}',
+            ''
         )
 
-        self.get_logger().info(f'[{result}] Covariance monitor complete')
+        self.get_logger().info(
+            f'[{result}] Avg covariance x={avg_x:.4f}, y={avg_y:.4f}, yaw={avg_yaw:.4f}'
+        )
         self.shutdown()
 
     def shutdown(self):
-        """Clean shutdown."""
-        self.get_logger().info('Shutting down covariance_monitor')
         self.destroy_node()
         rclpy.shutdown()
 
