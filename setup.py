@@ -30,6 +30,9 @@ setup(
             'covariance_monitor = tb3_localization_validation.covariance_monitor:main',
             'yaw_alignment_check = tb3_localization_validation.yaw_alignment_check:main',
             'map_odom_tf_check = tb3_localization_validation.map_odom_tf_check:main',
+            'amcl_rotation_tracking = tb3_localization_validation.amcl_rotation_tracking:main',
+            'amcl_translation_tracking = tb3_localization_validation.amcl_translation_tracking:main',
+            'amcl_relocalization_test = tb3_localization_validation.amcl_relocalization_test:main',
             # Added to print and reset json output
             'reset_results = tb3_tf_validation.reset_results:main',
             'summary_report = tb3_tf_validation.summary_report:main',

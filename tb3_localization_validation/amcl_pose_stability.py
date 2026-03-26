@@ -7,6 +7,75 @@ Checks whether AMCL pose remains stable while the robot is stationary.
 
 Usage:
   ros2 run tb3_localization_validation amcl_pose_stability --ros-args -p use_sim_time:=true
+
+-------------------------------------------------------------------------------
+IMPORTANT NOTE ON THE FIX (WHY /amcl_pose MAY EXIST BUT THIS NODE GETS NO DATA)
+-------------------------------------------------------------------------------
+
+You may see this situation:
+
+    ros2 topic echo /amcl_pose --once
+
+returns a valid message, but your script appears to hang waiting for /amcl_pose,
+or times out without collecting samples.
+
+This is usually NOT because AMCL is broken.
+
+The issue is typically ROS 2 QoS compatibility.
+
+WHY THIS HAPPENS:
+
+- /amcl_pose is often published in a latched-style way.
+- In ROS 2 terms, that usually means TRANSIENT_LOCAL durability.
+- `ros2 topic echo` can often receive the last stored message automatically.
+- But a normal subscriber using default QoS may NOT receive that stored message.
+
+So the topic exists and AMCL is publishing, but this node still sees:
+    self.latest_msg is None
+
+RESULT:
+- wait_for_first_message() may time out
+- no samples are collected
+- the test fails even though AMCL is actually working
+
+-------------------------------------------------------------------------------
+THE FIX
+-------------------------------------------------------------------------------
+
+We explicitly subscribe to /amcl_pose using:
+
+    reliability = RELIABLE
+    durability = TRANSIENT_LOCAL
+
+This tells ROS 2:
+
+    "Give me the latest stored /amcl_pose message immediately,
+     even if it was published before this node started."
+
+That is why the script now works reliably.
+
+-------------------------------------------------------------------------------
+WHAT THIS TEST MEASURES
+-------------------------------------------------------------------------------
+
+This is NOT a localization accuracy test.
+
+It measures STABILITY of the AMCL pose estimate while the robot is stationary:
+
+- x jitter
+- y jitter
+- yaw jitter
+- x span
+- y span
+- yaw span
+- average covariance in x, y, yaw
+
+This is useful for checking:
+- whether AMCL is converged
+- whether localization is noisy while stationary
+- whether the estimate is steady enough before Nav2 testing
+
+-------------------------------------------------------------------------------
 """
 
 import math
@@ -44,6 +113,26 @@ class AmclPoseStability(Node):
         self.latest_msg = None
         self.received_count = 0
 
+        # =====================================================================
+        # CRITICAL FIX: AMCL QoS COMPATIBILITY
+        # =====================================================================
+        #
+        # /amcl_pose may use TRANSIENT_LOCAL durability.
+        # If we subscribe with default QoS, we may receive nothing even though:
+        #
+        #   ros2 topic echo /amcl_pose --once
+        #
+        # works fine.
+        #
+        # WHY:
+        # A default VOLATILE subscriber only gets new messages after it starts.
+        # A TRANSIENT_LOCAL subscriber can receive the latest stored AMCL pose.
+        #
+        # FIX:
+        # We explicitly request:
+        #   - RELIABLE reliability
+        #   - TRANSIENT_LOCAL durability
+        #
         amcl_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
@@ -125,6 +214,10 @@ class AmclPoseStability(Node):
             samples_y.append(y)
             samples_yaw.append(yaw)
 
+            # Flattened 6x6 covariance matrix
+            # x variance   -> index 0
+            # y variance   -> index 7
+            # yaw variance -> index 35
             cov_xx.append(cov[0])
             cov_yy.append(cov[7])
             cov_yawyaw.append(cov[35])
