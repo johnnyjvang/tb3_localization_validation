@@ -3,26 +3,18 @@
 """
 amcl_relocalization_test.py
 
-Test whether AMCL can recover after being intentionally given a wrong initial pose.
+Simple relocalization test:
+1. Wait for /amcl_pose and /odom
+2. Record start AMCL + odom pose
+3. Publish an intentionally wrong /initialpose
+4. Move the robot
+5. Record end AMCL + odom pose
+6. Compare AMCL motion vs odom motion
 
-UPDATED FIXES:
-1. Add a small motion sequence after publishing the wrong pose, because
-   stationary relocalization often does not recover well.
-2. Throttle recovery logging so the node does not spam the terminal.
-3. Make shutdown safe so Ctrl+C does not cause a publisher context error.
+Purpose:
+- Verify AMCL recovers enough to track translation + rotation after being
+  intentionally given a wrong initial pose.
 
-Why the RViz map jumps:
-- Publishing a wrong /initialpose causes AMCL to change the map->odom transform.
-- In RViz, that often looks like the map shifts or rotates.
-- That is expected for this test.
-
-Why the old version spammed:
-- The recovery loop ran at 20 Hz and printed on every cycle.
-- This version prints recovery status at most once per second.
-
-Why the old version crashed on Ctrl+C:
-- The node tried to publish a stop command after ROS had already begun shutdown.
-- This version checks whether the ROS context is still valid before publishing.
 """
 
 import math
@@ -46,8 +38,8 @@ from .result_utils import append_result
 
 # ===== Topics =====
 AMCL_TOPIC = '/amcl_pose'
-INITIALPOSE_TOPIC = '/initialpose'
 ODOM_TOPIC = '/odom'
+INITIALPOSE_TOPIC = '/initialpose'
 CMD_VEL_TOPIC = '/cmd_vel'
 
 # ===== Timing =====
@@ -55,39 +47,34 @@ CONTROL_PERIOD = 0.05
 PROGRESS_PERIOD = 1.0
 STARTUP_WAIT_TIMEOUT = 15.0
 POST_WRONG_POSE_SETTLE = 2.0
-RECOVERY_TIMEOUT = 25.0
-MAX_TEST_TIME = 60.0
-SETTLE_BETWEEN_MOTIONS = 1.0
+SETTLE_TIME = 3.0
+MAX_TEST_TIME = 50.0
 
-# ===== Wrong initial pose offset =====
+# ===== Wrong pose offsets =====
 WRONG_OFFSET_X = 1.0
 WRONG_OFFSET_Y = 0.5
 WRONG_OFFSET_YAW_DEG = 30.0
 
-# ===== Recovery thresholds =====
-PASS_POS_ERROR_M = 0.20
-WARN_POS_ERROR_M = 0.50
-PASS_YAW_ERROR_DEG = 10.0
-WARN_YAW_ERROR_DEG = 25.0
-
-# ===== Motion sequence to help relocalization =====
+# ===== Motion sequence =====
 ROTATE_SPEED = 0.35
-ROTATE_DURATION_1 = 2.0
-FORWARD_SPEED = 0.06
-FORWARD_DURATION = 3.0
-ROTATE_DURATION_2 = 2.0
+ROTATE_DURATION = 2.0
+
+FORWARD_SPEED = 0.08
+FORWARD_DURATION = 5.0
+
+# ===== Thresholds =====
+MIN_ODOM_DISTANCE_M = 0.20
+PASS_DIST_DIFF_M = 0.15
+WARN_DIST_DIFF_M = 0.30
+
+PASS_YAW_DIFF_DEG = 15.0
+WARN_YAW_DIFF_DEG = 30.0
 
 
-def yaw_to_quaternion(yaw_rad: float) -> Tuple[float, float]:
-    qz = math.sin(yaw_rad / 2.0)
-    qw = math.cos(yaw_rad / 2.0)
-    return qz, qw
-
-
-def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    return math.atan2(siny_cosp, cosy_cosp)
+def euclidean_distance(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    dx = b[0] - a[0]
+    dy = b[1] - a[1]
+    return math.sqrt(dx * dx + dy * dy)
 
 
 def normalize_angle_deg(angle_deg: float) -> float:
@@ -98,10 +85,16 @@ def normalize_angle_deg(angle_deg: float) -> float:
     return angle_deg
 
 
-def euclidean_distance(x1: float, y1: float, x2: float, y2: float) -> float:
-    dx = x2 - x1
-    dy = y2 - y1
-    return math.sqrt(dx * dx + dy * dy)
+def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def yaw_to_quaternion(yaw_rad: float) -> Tuple[float, float]:
+    qz = math.sin(yaw_rad / 2.0)
+    qw = math.cos(yaw_rad / 2.0)
+    return qz, qw
 
 
 class AMCLRelocalizationTest(Node):
@@ -115,8 +108,8 @@ class AMCLRelocalizationTest(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
 
-        self.latest_amcl_pose: Optional[PoseWithCovarianceStamped] = None
-        self.latest_odom: Optional[Odometry] = None
+        self.amcl_msg: Optional[PoseWithCovarianceStamped] = None
+        self.odom_msg: Optional[Odometry] = None
         self.amcl_count = 0
         self.odom_count = 0
 
@@ -152,51 +145,78 @@ class AMCLRelocalizationTest(Node):
         self.finish_time = None
         self.done = False
 
-        self.reference_pose: Optional[Tuple[float, float, float]] = None
-        self.recovery_start_time = None
-        self.recovered_time = None
+        self.start_amcl_pose = None
+        self.start_odom_pose = None
+        self.end_amcl_pose = None
+        self.end_odom_pose = None
 
         self.start_amcl_count = 0
         self.end_amcl_count = 0
-        self.last_recovery_log_time = 0.0
 
         self.timer = self.create_timer(CONTROL_PERIOD, self.loop)
         self.progress_timer = self.create_timer(PROGRESS_PERIOD, self.progress_update)
 
         self.get_logger().info('========== AMCL RELOCALIZATION TEST ==========')
         self.get_logger().info(f'AMCL topic: {AMCL_TOPIC}')
-        self.get_logger().info(f'Initial pose topic: {INITIALPOSE_TOPIC}')
         self.get_logger().info(f'Odom topic: {ODOM_TOPIC}')
+        self.get_logger().info(f'Initial pose topic: {INITIALPOSE_TOPIC}')
         self.get_logger().info(f'Command topic: {CMD_VEL_TOPIC}')
 
     def amcl_cb(self, msg: PoseWithCovarianceStamped) -> None:
-        self.latest_amcl_pose = msg
+        self.amcl_msg = msg
         self.amcl_count += 1
 
     def odom_cb(self, msg: Odometry) -> None:
-        self.latest_odom = msg
+        self.odom_msg = msg
         self.odom_count += 1
 
+    def have_required_topics(self) -> bool:
+        return self.amcl_msg is not None and self.odom_msg is not None
+
     def get_amcl_pose(self) -> Optional[Tuple[float, float, float]]:
-        if self.latest_amcl_pose is None:
+        if self.amcl_msg is None:
             return None
-        p = self.latest_amcl_pose.pose.pose.position
-        q = self.latest_amcl_pose.pose.pose.orientation
+        p = self.amcl_msg.pose.pose.position
+        q = self.amcl_msg.pose.pose.orientation
         yaw = quaternion_to_yaw(q.x, q.y, q.z, q.w)
         return (p.x, p.y, yaw)
 
-    def build_wrong_initial_pose(self, ref_x: float, ref_y: float, ref_yaw_deg: float):
+    def get_odom_pose(self) -> Optional[Tuple[float, float, float]]:
+        if self.odom_msg is None:
+            return None
+        p = self.odom_msg.pose.pose.position
+        q = self.odom_msg.pose.pose.orientation
+        yaw = quaternion_to_yaw(q.x, q.y, q.z, q.w)
+        return (p.x, p.y, yaw)
+
+    def publish_cmd(self, linear_x: float = 0.0, angular_z: float = 0.0) -> None:
+        cmd = TwistStamped()
+        cmd.twist.linear.x = linear_x
+        cmd.twist.angular.z = angular_z
+        self.cmd_pub.publish(cmd)
+
+    def stop_robot(self) -> None:
+        self.publish_cmd(0.0, 0.0)
+
+    def publish_wrong_initial_pose(self) -> None:
+        current = self.get_amcl_pose()
+        if current is None:
+            return
+
+        x, y, yaw = current
+        wrong_x = x + WRONG_OFFSET_X
+        wrong_y = y + WRONG_OFFSET_Y
+        wrong_yaw = yaw + math.radians(WRONG_OFFSET_YAW_DEG)
+
         msg = PoseWithCovarianceStamped()
         msg.header.frame_id = 'map'
         msg.header.stamp = self.get_clock().now().to_msg()
 
-        msg.pose.pose.position.x = ref_x + WRONG_OFFSET_X
-        msg.pose.pose.position.y = ref_y + WRONG_OFFSET_Y
+        msg.pose.pose.position.x = wrong_x
+        msg.pose.pose.position.y = wrong_y
         msg.pose.pose.position.z = 0.0
 
-        yaw_deg = ref_yaw_deg + WRONG_OFFSET_YAW_DEG
-        yaw_rad = math.radians(yaw_deg)
-        qz, qw = yaw_to_quaternion(yaw_rad)
+        qz, qw = yaw_to_quaternion(wrong_yaw)
         msg.pose.pose.orientation.z = qz
         msg.pose.pose.orientation.w = qw
 
@@ -205,36 +225,14 @@ class AMCLRelocalizationTest(Node):
         cov[7] = 0.25
         cov[35] = 0.0685
         msg.pose.covariance = cov
-        return msg
 
-    def publish_wrong_initial_pose(self) -> None:
-        ref_x, ref_y, ref_yaw = self.reference_pose
-        ref_yaw_deg = math.degrees(ref_yaw)
-
-        msg = self.build_wrong_initial_pose(ref_x, ref_y, ref_yaw_deg)
         self.initial_pose_pub.publish(msg)
 
-        self.start_amcl_count = self.amcl_count
-
         self.get_logger().warn(
-            '[WARN] Published intentionally wrong initial pose '
-            f'(dx={WRONG_OFFSET_X:.2f}, dy={WRONG_OFFSET_Y:.2f}, '
-            f'dyaw={WRONG_OFFSET_YAW_DEG:.2f} deg)'
+            f'[WARN] Published wrong initial pose: '
+            f'dx={WRONG_OFFSET_X:.2f}, dy={WRONG_OFFSET_Y:.2f}, '
+            f'dyaw={WRONG_OFFSET_YAW_DEG:.2f} deg'
         )
-
-    def publish_cmd(self, linear_x: float = 0.0, angular_z: float = 0.0) -> None:
-        if not rclpy.ok():
-            return
-        msg = TwistStamped()
-        msg.twist.linear.x = linear_x
-        msg.twist.angular.z = angular_z
-        try:
-            self.cmd_pub.publish(msg)
-        except Exception:
-            pass
-
-    def stop_robot(self) -> None:
-        self.publish_cmd(0.0, 0.0)
 
     def transition(self, new_phase: str) -> None:
         self.phase = new_phase
@@ -275,17 +273,87 @@ class AMCLRelocalizationTest(Node):
         self.done = True
         self.finish_time = time.time()
 
-    def analyze_current_error(self) -> Optional[Tuple[float, float]]:
-        current = self.get_amcl_pose()
-        if current is None or self.reference_pose is None:
-            return None
+    def analyze(self) -> None:
+        if (
+            self.start_amcl_pose is None or
+            self.start_odom_pose is None or
+            self.end_amcl_pose is None or
+            self.end_odom_pose is None
+        ):
+            self.finish_and_exit(
+                'FAIL',
+                'missing pose snapshots',
+                'could not record required AMCL/odom start/end poses'
+            )
+            return
 
-        cx, cy, cyaw = current
-        rx, ry, ryaw = self.reference_pose
+        amcl_updates = self.end_amcl_count - self.start_amcl_count
 
-        pos_error = euclidean_distance(rx, ry, cx, cy)
-        yaw_error = abs(normalize_angle_deg(math.degrees(cyaw - ryaw)))
-        return pos_error, yaw_error
+        start_amcl_xy = (self.start_amcl_pose[0], self.start_amcl_pose[1])
+        end_amcl_xy = (self.end_amcl_pose[0], self.end_amcl_pose[1])
+
+        start_odom_xy = (self.start_odom_pose[0], self.start_odom_pose[1])
+        end_odom_xy = (self.end_odom_pose[0], self.end_odom_pose[1])
+
+        amcl_dist = euclidean_distance(start_amcl_xy, end_amcl_xy)
+        odom_dist = euclidean_distance(start_odom_xy, end_odom_xy)
+        dist_diff = abs(amcl_dist - odom_dist)
+
+        amcl_yaw_change_deg = abs(normalize_angle_deg(
+            math.degrees(self.end_amcl_pose[2] - self.start_amcl_pose[2])
+        ))
+        odom_yaw_change_deg = abs(normalize_angle_deg(
+            math.degrees(self.end_odom_pose[2] - self.start_odom_pose[2])
+        ))
+        yaw_diff_deg = abs(amcl_yaw_change_deg - odom_yaw_change_deg)
+
+        self.get_logger().info('========== ANALYSIS ==========')
+        self.get_logger().info(f'[INFO] New AMCL messages during test: {amcl_updates}')
+        self.get_logger().info(f'[INFO] AMCL distance: {amcl_dist:.3f} m')
+        self.get_logger().info(f'[INFO] Odom distance: {odom_dist:.3f} m')
+        self.get_logger().info(f'[INFO] Distance difference: {dist_diff:.3f} m')
+        self.get_logger().info(f'[INFO] AMCL yaw change: {amcl_yaw_change_deg:.2f} deg')
+        self.get_logger().info(f'[INFO] Odom yaw change: {odom_yaw_change_deg:.2f} deg')
+        self.get_logger().info(f'[INFO] Yaw difference: {yaw_diff_deg:.2f} deg')
+
+        if amcl_updates <= 0:
+            self.finish_and_exit(
+                'FAIL',
+                'amcl did not update',
+                'received no new /amcl_pose messages during relocalization test'
+            )
+            return
+
+        if odom_dist < MIN_ODOM_DISTANCE_M:
+            self.finish_and_exit(
+                'FAIL',
+                f'odom distance too small ({odom_dist:.3f} m)',
+                'robot did not move enough for meaningful relocalization comparison'
+            )
+            return
+
+        if dist_diff <= PASS_DIST_DIFF_M and yaw_diff_deg <= PASS_YAW_DIFF_DEG:
+            status = 'PASS'
+        elif dist_diff <= WARN_DIST_DIFF_M and yaw_diff_deg <= WARN_YAW_DIFF_DEG:
+            status = 'WARN'
+        else:
+            status = 'FAIL'
+
+        measurement = (
+            f'amcl_dist={amcl_dist:.3f} m | '
+            f'odom_dist={odom_dist:.3f} m | '
+            f'dist_diff={dist_diff:.3f} m | '
+            f'yaw_diff={yaw_diff_deg:.2f} deg'
+        )
+
+        notes = (
+            f'wrong_pose_dx={WRONG_OFFSET_X:.2f}, '
+            f'wrong_pose_dy={WRONG_OFFSET_Y:.2f}, '
+            f'wrong_pose_dyaw={WRONG_OFFSET_YAW_DEG:.2f} deg, '
+            f'amcl_updates={amcl_updates}'
+        )
+
+        self.finish_and_exit(status, measurement, notes)
 
     def loop(self) -> None:
         now = time.time()
@@ -307,48 +375,52 @@ class AMCLRelocalizationTest(Node):
             return
 
         if self.phase == 'wait_for_ready':
-            pose = self.get_amcl_pose()
-            if pose is not None:
-                self.reference_pose = pose
-                x, y, yaw = pose
+            self.stop_robot()
+
+            if self.have_required_topics():
+                self.start_amcl_pose = self.get_amcl_pose()
+                self.start_odom_pose = self.get_odom_pose()
+                self.start_amcl_count = self.amcl_count
+
                 self.get_logger().info(
-                    f'[INFO] Reference AMCL pose: x={x:.3f}, y={y:.3f}, yaw={math.degrees(yaw):.2f} deg'
+                    f'[INFO] Start AMCL pose: '
+                    f'x={self.start_amcl_pose[0]:.3f}, y={self.start_amcl_pose[1]:.3f}, '
+                    f'yaw={math.degrees(self.start_amcl_pose[2]):.2f} deg'
                 )
+                self.get_logger().info(
+                    f'[INFO] Start Odom pose: '
+                    f'x={self.start_odom_pose[0]:.3f}, y={self.start_odom_pose[1]:.3f}, '
+                    f'yaw={math.degrees(self.start_odom_pose[2]):.2f} deg'
+                )
+
                 self.transition('publish_wrong_pose')
                 return
 
             if phase_elapsed >= STARTUP_WAIT_TIMEOUT:
                 self.finish_and_exit(
                     'FAIL',
-                    'amcl not initialized',
-                    'did not receive /amcl_pose; make sure Nav2 is launched with a valid map and initial pose has been set'
+                    'startup readiness timeout',
+                    f'timed out waiting for topics; amcl_msgs={self.amcl_count}, odom_msgs={self.odom_count}'
                 )
                 return
             return
 
         if self.phase == 'publish_wrong_pose':
             self.publish_wrong_initial_pose()
-            self.recovery_start_time = time.time()
-            self.last_recovery_log_time = 0.0
             self.transition('wait_after_wrong_pose')
             return
 
         if self.phase == 'wait_after_wrong_pose':
+            self.stop_robot()
             if phase_elapsed >= POST_WRONG_POSE_SETTLE:
-                self.transition('rotate_1')
+                self.transition('rotate')
             return
 
-        if self.phase == 'rotate_1':
-            if phase_elapsed < ROTATE_DURATION_1:
+        if self.phase == 'rotate':
+            if phase_elapsed < ROTATE_DURATION:
                 self.publish_cmd(0.0, ROTATE_SPEED)
             else:
                 self.stop_robot()
-                self.transition('settle_after_rotate_1')
-            return
-
-        if self.phase == 'settle_after_rotate_1':
-            self.stop_robot()
-            if phase_elapsed >= SETTLE_BETWEEN_MOTIONS:
                 self.transition('forward')
             return
 
@@ -357,64 +429,29 @@ class AMCLRelocalizationTest(Node):
                 self.publish_cmd(FORWARD_SPEED, 0.0)
             else:
                 self.stop_robot()
-                self.transition('settle_after_forward')
+                self.transition('settling')
             return
 
-        if self.phase == 'settle_after_forward':
+        if self.phase == 'settling':
             self.stop_robot()
-            if phase_elapsed >= SETTLE_BETWEEN_MOTIONS:
-                self.transition('rotate_2')
-            return
+            if phase_elapsed >= SETTLE_TIME:
+                self.end_amcl_pose = self.get_amcl_pose()
+                self.end_odom_pose = self.get_odom_pose()
+                self.end_amcl_count = self.amcl_count
 
-        if self.phase == 'rotate_2':
-            if phase_elapsed < ROTATE_DURATION_2:
-                self.publish_cmd(0.0, -ROTATE_SPEED)
-            else:
-                self.stop_robot()
-                self.transition('check_recovery')
-            return
-
-        if self.phase == 'check_recovery':
-            errors = self.analyze_current_error()
-            if errors is None:
-                return
-
-            pos_error, yaw_error = errors
-            self.end_amcl_count = self.amcl_count
-            amcl_updates = self.end_amcl_count - self.start_amcl_count
-
-            # Throttle recovery logs to once per second
-            if now - self.last_recovery_log_time >= 1.0:
-                self.last_recovery_log_time = now
                 self.get_logger().info(
-                    f'[INFO] Current recovery error: pos={pos_error:.3f} m, yaw={yaw_error:.2f} deg'
+                    f'[INFO] End AMCL pose: '
+                    f'x={self.end_amcl_pose[0]:.3f}, y={self.end_amcl_pose[1]:.3f}, '
+                    f'yaw={math.degrees(self.end_amcl_pose[2]):.2f} deg'
                 )
                 self.get_logger().info(
-                    f'[INFO] New AMCL messages since wrong pose: {amcl_updates}'
+                    f'[INFO] End Odom pose: '
+                    f'x={self.end_odom_pose[0]:.3f}, y={self.end_odom_pose[1]:.3f}, '
+                    f'yaw={math.degrees(self.end_odom_pose[2]):.2f} deg'
                 )
 
-            if pos_error <= PASS_POS_ERROR_M and yaw_error <= PASS_YAW_ERROR_DEG:
-                self.recovered_time = time.time()
-                recovery_time = self.recovered_time - self.recovery_start_time
-                self.finish_and_exit(
-                    'PASS',
-                    f'recovery_time={recovery_time:.2f} s',
-                    f'final_pos_error={pos_error:.3f} m, final_yaw_error={yaw_error:.2f} deg, amcl_updates={amcl_updates}'
-                )
-                return
-
-            if phase_elapsed >= RECOVERY_TIMEOUT:
-                if pos_error <= WARN_POS_ERROR_M and yaw_error <= WARN_YAW_ERROR_DEG:
-                    status = 'WARN'
-                else:
-                    status = 'FAIL'
-
-                self.finish_and_exit(
-                    status,
-                    f'no full recovery in {RECOVERY_TIMEOUT:.1f} s',
-                    f'final_pos_error={pos_error:.3f} m, final_yaw_error={yaw_error:.2f} deg, amcl_updates={amcl_updates}'
-                )
-                return
+                self.analyze()
+            return
 
 
 def main(args=None):
@@ -424,13 +461,10 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        node.stop_robot()
     finally:
         if rclpy.ok():
-            try:
-                node.stop_robot()
-            except Exception:
-                pass
+            node.stop_robot()
             node.destroy_node()
             rclpy.shutdown()
 
